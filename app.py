@@ -12,7 +12,7 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from stock_search import advisor
-from stock_search.analysis import analyze, market_regime, portfolio_risk, position_size, review_holding
+from stock_search.analysis import analyze, buy_plan, market_regime, portfolio_risk, position_size, review_holding
 from stock_search.backtest import backtest
 from stock_search.indicators import add_indicators
 from stock_search.market import BENCHMARK, MARKET_INDICES, MarketData, normalize_ticker
@@ -81,6 +81,14 @@ def tracked_tickers() -> list[str]:
     return list(dict.fromkeys(list(h["ticker"]) + list(w["ticker"])))
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def screen_universe(extra: tuple[tuple[str, str], ...] = ()) -> pd.DataFrame:
+    universe = dict(DEFAULT_UNIVERSE)
+    for t, n in extra:
+        universe.setdefault(t, n)
+    return screen(load_histories(tuple(universe)), universe)
+
+
 def regime() -> dict:
     idx = load_history("^N225", "2y")
     vix = load_history("^VIX", "6mo")
@@ -133,11 +141,96 @@ with st.sidebar:
     st.caption("株価データ: Yahoo Finance（東証は約15〜20分遅延）")
     st.caption("※ 本ツールは情報提供目的です。投資判断はご自身の責任で行ってください。")
 
-tabs = st.tabs(["📊 ダッシュボード", "💼 保有銘柄", "⚡ リアルタイム", "🔍 分析・提案", "🧭 スクリーナー",
+tabs = st.tabs(["🎯 買い候補", "📊 ダッシュボード", "💼 保有銘柄", "⚡ リアルタイム", "🔍 分析・提案", "🧭 スクリーナー",
                 "🧪 バックテスト", "🤖 AI提案", "📒 売買記録"])
 
-# ================================================================ ダッシュボード
+# ================================================================ 買い候補
 with tabs[0]:
+    r = regime()
+    st.subheader("🎯 今の買い候補と買い方")
+    st.caption(f"地合い: **{r['label']}**　／　1〜3か月のスイングトレード前提　／　"
+               f"資金 ¥{capital:,.0f}・1トレードの許容損失 {settings['risk_per_trade_pct']:.1f}%（左のサイドバーで変更）")
+    c = st.columns([1, 1, 2])
+    n_show = c[0].slider("表示する銘柄数", 3, 10, 5)
+    hide_held = c[1].toggle("保有中の銘柄は除く", value=True)
+    if c[2].button("🔄 最新データで再計算"):
+        screen_universe.clear()
+    wl = tuple((x["ticker"], x["name"] or "") for x in store.watchlist().to_dict("records"))
+    with st.spinner("約80銘柄の株価を分析中...（初回は30秒〜1分ほどかかります）"):
+        cand = screen_universe(wl)
+    if r["size_factor"] < 1:
+        st.warning("市場環境を踏まえて推奨株数を自動で減らしています（×{:.2f}）。無理に買わず、候補を絞るのも選択肢です。\n\n".format(r["size_factor"])
+                   + "\n".join(f"- {n}" for n in r["notes"]))
+    if cand.empty:
+        st.error("株価データを取得できませんでした。時間をおいて「最新データで再計算」を押してください。")
+    else:
+        held = set(store.holdings()["ticker"])
+        pool = cand[(cand["score"] >= 20) & ~cand["setup"].isin(["様子見 / 空売り候補"])]
+        if hide_held:
+            pool = pool[~pool["ticker"].isin(held)]
+        # 明確なセットアップがある銘柄を優先
+        pool = pool.assign(_clear=pool["setup"] != "明確なセットアップなし").sort_values(["_clear", "score"], ascending=False)
+        if pool.empty:
+            st.info("いま条件を満たす買い候補はありません。こういう時は「買わない」のも立派な判断です。")
+        hist_all = load_histories(tuple(pool["ticker"].head(n_show)))
+        for rank, row in enumerate(pool.head(n_show).to_dict("records"), start=1):
+            t = row["ticker"]
+            a = analyze(t, hist_all.get(t))
+            if a is None:
+                continue
+            plan = buy_plan(a, capital, settings["risk_per_trade_pct"], settings["max_position_pct"], r["size_factor"])
+            with st.container(border=True):
+                st.markdown(f"### {rank}. {name_of(t, row['name'])}（{t.replace('.T', '')}）　"
+                            f"{a.signal}・スコア {a.score:+.0f}")
+                st.markdown(f"**{a.setup}**　｜　{a.trend}　｜　現在値 **{a.price:,.0f}円**")
+                pct = lambda v: f"{v / plan.limit_price - 1:+.1%}"
+                st.markdown(
+                    "| 買う価格帯 | 損切り | 利確①（半分） | 利確②（残り） | 保有期間の目安 |\n|:-:|:-:|:-:|:-:|:-:|\n"
+                    f"| **{plan.entry_low:,.0f}〜{plan.entry_high:,.0f}円** "
+                    f"| **{plan.stop:,.0f}円**<br>:blue[{pct(plan.stop)}] "
+                    f"| **{plan.target1:,.0f}円**<br>:red[{pct(plan.target1)}] "
+                    f"| **{plan.target2:,.0f}円**<br>:red[{pct(plan.target2)}] "
+                    f"| **{plan.holding_text}**<br>最長3か月 |",
+                    unsafe_allow_html=True,
+                )
+                sz = plan.sizing
+                st.markdown(f"**推奨株数: {sz.shares:,}株（約{sz.cost:,.0f}円）**　"
+                            f"— 損切りになった場合の損失は約{sz.risk_amount:,.0f}円（資金の{sz.risk_pct_of_capital:.1f}%）")
+                if sz.note:
+                    st.caption(sz.note)
+                st.markdown(f"**買い方:** {plan.entry_method}")
+                st.info(plan.order_guide)
+                cc = st.columns(2)
+                cc[0].markdown("**この銘柄を選んだ理由**\n" + "\n".join(f"- {x}" for x in a.reasons) if a.reasons else "")
+                cc[1].markdown("**売り方のルール**\n" + "\n".join(f"- {x}" for x in plan.exit_rules))
+                warns = list(a.risks)
+                earn = load_earnings(t)
+                if earn is not None and pd.Timestamp(earn).date() >= date.today():
+                    days_to = (pd.Timestamp(earn).date() - date.today()).days
+                    if days_to <= plan.holding_days * 7 / 5:
+                        warns.append(f"保有期間中に決算発表（{pd.Timestamp(earn):%m/%d}、あと{days_to}日）があります。"
+                                     "決算で株価が大きく飛ぶと損切りが効かないことがあるので、決算前に一部利確するか株数を減らすのが無難")
+                if warns:
+                    st.warning("**注意点**\n" + "\n".join(f"- {x}" for x in warns))
+                ec = st.columns([1, 1, 3])
+                if ec[0].button("👀 ウォッチリストへ", key=f"w_{t}"):
+                    store.add_watch(t, name_of(t, row["name"]), f"買い候補 {date.today():%m/%d}")
+                    st.toast(f"{t} をウォッチリストに追加しました")
+                with ec[2].popover("🛒 購入したら記録する"):
+                    with st.form(f"buy_{t}"):
+                        bs = st.number_input("買った株数", value=float(sz.shares or 100), step=100.0, key=f"bs_{t}")
+                        bp = st.number_input("買った単価", value=float(plan.limit_price), step=1.0, key=f"bp_{t}")
+                        ba = st.selectbox("口座", ACCOUNT_TYPES, key=f"ba_{t}")
+                        if st.form_submit_button("保有銘柄に追加（損切り・利確ラインも登録）"):
+                            store.add_holding(t, bs, bp, name=name_of(t, row["name"]), account=ba,
+                                              stop_loss=plan.stop, take_profit=plan.target1,
+                                              memo=f"{a.setup}／目標② {plan.target2:,.0f}円／{plan.holding_text}")
+                            st.success("登録しました。リアルタイムタブで損切り・利確ラインへの到達を監視します。")
+        st.caption("※ テクニカル指標に基づく機械的な候補です。業績やニュースは「🤖 AI提案」タブで確認できます。"
+                   "投資判断はご自身の責任でお願いします。")
+
+# ================================================================ ダッシュボード
+with tabs[1]:
     @st.fragment(run_every=60)
     def dashboard():
         st.subheader("マーケット概況")
@@ -176,7 +269,7 @@ with tabs[0]:
     dashboard()
 
 # ================================================================ 保有銘柄
-with tabs[1]:
+with tabs[2]:
     st.subheader("保有銘柄の登録")
     with st.form("add_holding", clear_on_submit=True):
         c = st.columns([1.2, 1.5, 1, 1, 1, 1.4])
@@ -261,7 +354,7 @@ with tabs[1]:
             st.rerun()
 
 # ================================================================ リアルタイム
-with tabs[2]:
+with tabs[3]:
     c = st.columns([2, 1, 1])
     extra = c[0].text_input("追加で表示する銘柄（カンマ区切り）", placeholder="6857, 8035, NVDA")
     interval = c[1].selectbox("自動更新間隔", [15, 30, 60, 300], index=1, format_func=lambda s: f"{s}秒")
@@ -324,7 +417,7 @@ with tabs[2]:
             st.plotly_chart(price_chart(sel, df, plan), width="stretch")
 
 # ================================================================ 分析・提案
-with tabs[3]:
+with tabs[4]:
     r = regime()
     st.markdown(f"**地合い: {r['label']}** — 新規ポジションのサイズ係数 ×{r['size_factor']:.2f}")
     h = store.holdings()
@@ -448,7 +541,7 @@ with tabs[3]:
                             width="stretch")
 
 # ================================================================ スクリーナー
-with tabs[4]:
+with tabs[5]:
     st.subheader("スイング候補のスクリーニング")
     st.caption("東証プライム主要銘柄＋ウォッチリストを分析し、総合スコア順に表示します（初回は1分程度かかります）。")
     c = st.columns([1, 1, 2])
@@ -484,7 +577,7 @@ with tabs[4]:
             st.success("追加しました")
 
 # ================================================================ バックテスト
-with tabs[5]:
+with tabs[6]:
     st.subheader("シグナルの検証（簡易バックテスト）")
     st.caption("「スコアが閾値以上で買い → 損切り or 目標2（R:R 1:3）or 最大保有日数で手仕舞い」を過去データで検証します。"
                "銘柄ごとにこの手法が機能しやすいかの目安になります（手数料・税金は考慮していません）。")
@@ -513,7 +606,7 @@ with tabs[5]:
                 st.dataframe(res.trades, hide_index=True, width="stretch")
 
 # ================================================================ AI提案
-with tabs[6]:
+with tabs[7]:
     st.subheader("Claude による総合提案")
     if not advisor.is_available():
         st.info("この機能を使うには環境変数 `ANTHROPIC_API_KEY` を設定して再起動してください。"
@@ -559,7 +652,7 @@ with tabs[6]:
             st.markdown(st.session_state["advice"])
 
 # ================================================================ 売買記録
-with tabs[7]:
+with tabs[8]:
     st.subheader("売買記録と成績")
     tr = store.trades()
     if tr.empty:

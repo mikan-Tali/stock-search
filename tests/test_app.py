@@ -65,3 +65,14 @@ def test_backtest_button(app):
     app.run()
     app.button[[b.label for b in app.button].index("バックテスト実行")].click().run()
     assert not app.exception, app.exception
+
+
+def test_buy_candidates_tab_shows_plans(app):
+    app.run()
+    assert not app.exception, app.exception
+    infos = [i.value for i in app.info]
+    assert any("IFDOCO" in v for v in infos), infos
+    # 購入記録フォーム → 保有銘柄に損切り・利確付きで登録される
+    btn = next(b for b in app.button if b.label.startswith("保有銘柄に追加"))
+    btn.click().run()
+    assert not app.exception, app.exception

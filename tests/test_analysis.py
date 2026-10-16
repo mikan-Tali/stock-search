@@ -67,3 +67,25 @@ def test_portfolio_risk(uptrend, downtrend):
 def test_market_regime(uptrend, downtrend):
     assert market_regime(uptrend)["size_factor"] == 1.0
     assert market_regime(downtrend)["size_factor"] == 0.5
+
+
+def test_buy_plan(uptrend):
+    from stock_search.analysis import MAX_HOLD_DAYS, buy_plan
+
+    a = analyze("7203.T", uptrend)
+    p = buy_plan(a, capital=3_000_000)
+    assert p.stop < p.entry_low <= p.limit_price <= p.entry_high
+    assert p.target1 > p.limit_price and p.target2 > p.target1
+    assert abs((p.target1 - p.limit_price) - 2 * (p.limit_price - p.stop)) <= 1
+    assert 10 <= p.holding_days <= MAX_HOLD_DAYS and ("週間" in p.holding_text or "か月" in p.holding_text)
+    assert "IFDOCO" in p.order_guide
+    assert p.sizing.shares % 100 == 0
+
+
+def test_buy_plan_weak_market_halves_size(uptrend):
+    from stock_search.analysis import buy_plan
+
+    a = analyze("7203.T", uptrend)
+    full = buy_plan(a, capital=10_000_000, max_position_pct=100).sizing.shares
+    half = buy_plan(a, capital=10_000_000, max_position_pct=100, size_factor=0.5).sizing.shares
+    assert half < full

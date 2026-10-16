@@ -37,6 +37,8 @@ class StockAnalysis:
     stop: float = math.nan
     target1: float = math.nan
     target2: float = math.nan
+    sma25: float = math.nan
+    high20: float = math.nan
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -171,6 +173,7 @@ def analyze(ticker: str, df: pd.DataFrame, live_price: float | None = None) -> S
         trend=trend, rsi=round(rsi, 1), atr=atr, atr_pct=atr_pct, ret20=ret20, ret60=ret60,
         vol_ratio=round(vol_ratio, 2), dist_52w_high=dist_high, reasons=reasons, risks=risks,
         stop=round(stop, 1), target1=round(target1, 1), target2=round(target2, 1),
+        sma25=sma25, high20=float(d["High"].iloc[-21:-1].max()),
     )
 
 
@@ -334,3 +337,82 @@ def market_regime(index_df: pd.DataFrame | None, vix_df: pd.DataFrame | None = N
             factor *= 0.8
             notes.append(f"VIX {vix:.0f}：やや警戒")
     return {"label": label, "size_factor": factor, "notes": notes}
+
+
+MAX_HOLD_DAYS = 60  # 約3か月（営業日）
+
+
+def estimate_holding_days(entry: float, target: float, atr: float, ret60: float) -> int:
+    """目標到達までの営業日数の目安.
+
+    値動きの大きさ（ATR）から見た到達時間と、直近3か月の上昇ペースから見た到達時間の短い方。
+    """
+    dist = max(target - entry, 0.0)
+    if atr <= 0 or dist == 0:
+        return 20
+    by_vol = (dist / atr) ** 2
+    drift = ret60 / 60 * entry
+    by_trend = dist / drift if drift > 0 else by_vol
+    return int(np.clip(min(by_vol, by_trend), 10, MAX_HOLD_DAYS))
+
+
+def holding_period_text(days: int) -> str:
+    lo, hi = max(1, round(days * 0.7 / 5)), max(2, round(days * 1.3 / 5))
+    if hi >= 9:
+        return f"約{max(1, round(lo / 4.3))}〜{min(3, round(hi / 4.3)) or 1}か月"
+    return f"約{lo}〜{hi}週間"
+
+
+@dataclass
+class BuyPlan:
+    ticker: str
+    entry_low: float
+    entry_high: float
+    limit_price: float
+    entry_method: str
+    stop: float
+    target1: float
+    target2: float
+    risk_reward: float
+    holding_days: int
+    holding_text: str
+    order_guide: str
+    exit_rules: list[str]
+    sizing: PositionSize
+
+
+def buy_plan(a: StockAnalysis, capital: float, risk_pct: float = 1.0, max_position_pct: float = 25.0,
+             size_factor: float = 1.0) -> BuyPlan:
+    """買い候補に対して「いくらで・何株・どこで損切り/利確・どれくらい持つか」を作る."""
+    price, atr = a.price, a.atr
+    if a.setup.startswith("ブレイクアウト"):
+        lo, hi = price - 0.5 * atr, price + 0.3 * atr
+        method = (f"高値更新の勢いに乗る買い。{lo:,.0f}〜{hi:,.0f}円で購入。"
+                  f"{hi:,.0f}円より上に跳ねている日は追いかけず、押し目を待つ")
+    elif a.setup.startswith("押し目買い"):
+        lo = min(a.sma25, price - 0.3 * atr) if not math.isnan(a.sma25) else price - 0.5 * atr
+        hi = price
+        method = f"25日移動平均線付近までの調整を拾う買い。{lo:,.0f}〜{hi:,.0f}円で指値"
+    elif a.setup.startswith("リバウンド"):
+        lo, hi = price - 0.5 * atr, price
+        method = ("売られすぎからの反発狙い。下げ止まり（陽線で引ける・5日線を回復）を確認してから"
+                  f"{lo:,.0f}〜{hi:,.0f}円で、通常の半分の株数で")
+        size_factor *= 0.5
+    else:
+        lo, hi = price - 0.5 * atr, price
+        method = f"{lo:,.0f}〜{hi:,.0f}円で指値"
+    limit = round((lo + hi) / 2, 0)
+    stop = min(a.stop, limit - 1.0 * atr)
+    risk = limit - stop
+    t1, t2 = limit + 2 * risk, limit + 3 * risk
+    days = estimate_holding_days(limit, t1, atr, a.ret60)
+    sizing = position_size(a.ticker, limit, stop, capital * size_factor, risk_pct, max_position_pct)
+    guide = (f"IFDOCO注文（SBI・楽天・マネックス等で利用可）: 買い指値 {limit:,.0f}円 → "
+             f"利確の指値 {t1:,.0f}円 ／ 損切りの逆指値 {stop:,.0f}円 を同時に設定")
+    rules = [
+        f"目標1（{t1:,.0f}円）で半分を利確 → 残りは損切りを買値（{limit:,.0f}円）に引き上げて目標2（{t2:,.0f}円）を狙う",
+        f"終値で {stop:,.0f}円 を割ったら迷わず損切り",
+        f"{MAX_HOLD_DAYS}営業日（約3か月）経っても目標1に届かなければ、いったん手仕舞いして資金を回す",
+    ]
+    return BuyPlan(a.ticker, round(lo, 0), round(hi, 0), limit, method, round(stop, 0), round(t1, 0), round(t2, 0),
+                   2.0, days, holding_period_text(days), guide, rules, sizing)

@@ -58,6 +58,16 @@ CREATE TABLE IF NOT EXISTS watchlist (
     name TEXT,
     memo TEXT
 );
+CREATE TABLE IF NOT EXISTS funds (
+    name TEXT NOT NULL,
+    units REAL,
+    avg_price REAL,
+    nav REAL,
+    market_value REAL,
+    pnl REAL,
+    account TEXT,
+    imported_at TEXT
+);
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -177,6 +187,53 @@ class PortfolioStore:
     def set_setting(self, key: str, value: float) -> None:
         with self._tx() as c:
             c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, str(value)))
+
+    # ---- broker sync ----------------------------------------------------
+    def sync_holdings(self, df: pd.DataFrame) -> dict[str, int]:
+        """証券会社の保有一覧で現物の保有を置き換える.
+
+        CSV に含まれる口座の「買い」保有だけを入れ替える（信用建玉や他口座は触らない）。
+        同じ銘柄・口座の損切り/目標価格・メモ・取得日は引き継ぐ。
+        """
+        if df.empty:
+            return {"added": 0, "updated": 0, "removed": 0}
+        accounts = sorted(df["account"].unique())
+        marks = ",".join("?" * len(accounts))
+        old = pd.read_sql_query(
+            f"SELECT * FROM holdings WHERE side='買い' AND account IN ({marks})", self._conn, params=accounts)
+        keep = {(r["ticker"], r["account"]): r for r in old.to_dict("records")}
+        new_keys = set()
+        added = updated = 0
+        with self._tx() as c:
+            c.execute(f"DELETE FROM holdings WHERE side='買い' AND account IN ({marks})", accounts)
+            for rec in df.to_dict("records"):
+                key = (rec["ticker"], rec["account"])
+                new_keys.add(key)
+                prev = keep.get(key, {})
+                updated += bool(prev)
+                added += not prev
+                c.execute(
+                    "INSERT INTO holdings (ticker, name, shares, avg_price, side, account, opened_at, stop_loss, take_profit, memo)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (rec["ticker"], rec.get("name") or prev.get("name") or "", rec["shares"], rec["avg_price"], "買い",
+                     rec["account"], prev.get("opened_at"), prev.get("stop_loss"), prev.get("take_profit"),
+                     prev.get("memo") or ""),
+                )
+        return {"added": added, "updated": updated, "removed": len(set(keep) - new_keys)}
+
+    def replace_funds(self, df: pd.DataFrame) -> None:
+        with self._tx() as c:
+            c.execute("DELETE FROM funds")
+            for rec in df.to_dict("records"):
+                c.execute(
+                    "INSERT INTO funds (name, units, avg_price, nav, market_value, pnl, account, imported_at)"
+                    " VALUES (?,?,?,?,?,?,?,?)",
+                    (rec.get("name"), rec.get("units"), rec.get("avg_price"), rec.get("nav"),
+                     rec.get("market_value"), rec.get("pnl"), rec.get("account"), date.today().isoformat()),
+                )
+
+    def funds(self) -> pd.DataFrame:
+        return pd.read_sql_query("SELECT * FROM funds ORDER BY market_value DESC", self._conn)
 
     # ---- import / export -----------------------------------------------
     def export_holdings_csv(self) -> str:

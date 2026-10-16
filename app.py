@@ -14,6 +14,7 @@ from plotly.subplots import make_subplots
 from stock_search import advisor
 from stock_search.analysis import analyze, buy_plan, market_regime, portfolio_risk, position_size, review_holding
 from stock_search.backtest import backtest
+from stock_search.importers import parse_sbi_holdings
 from stock_search.indicators import add_indicators
 from stock_search.market import BENCHMARK, MARKET_INDICES, MarketData, normalize_ticker
 from stock_search.portfolio import ACCOUNT_TYPES, SIDES, PortfolioStore
@@ -264,13 +265,47 @@ with tabs[1]:
         c2.metric("含み損益", f"¥{total_pnl:,.0f}")
         c3.metric("本日の損益", f"¥{day_pnl:,.0f}")
         c4.metric("資金に対する投下比率", f"{total_mv / capital * 100:.0f}%" if capital else "-")
+        fd = store.funds()
+        if not fd.empty:
+            fv, fp = fd["market_value"].sum(), fd["pnl"].sum()
+            st.caption(f"投資信託（{fd['imported_at'].iloc[0]} 取込時点）: 評価額 ¥{fv:,.0f}・評価損益 ¥{fp:+,.0f}　／　"
+                       f"個別株を含む合計 ¥{fv + total_mv:,.0f}（個別株の比率 {total_mv / (fv + total_mv):.0%}）")
         st.caption(f"最終更新: {pd.Timestamp.now():%H:%M:%S}（60秒ごとに自動更新）")
 
     dashboard()
 
 # ================================================================ 保有銘柄
 with tabs[2]:
-    st.subheader("保有銘柄の登録")
+    with st.container(border=True):
+        st.subheader("📥 SBI証券の保有一覧を取り込む")
+        st.caption("SBI証券にログイン →「口座管理」→「保有証券」→ 画面下の「CSVダウンロード」で保存したファイルをそのまま選択してください。"
+                   "取り込むたびに最新の保有株数・取得単価に更新されます（設定済みの損切り・目標価格・メモは引き継ぎます）。")
+        sbi_file = st.file_uploader("保有証券一覧の CSV（SaveFile.csv）", type="csv", key="sbi_upload")
+        if sbi_file is not None:
+            try:
+                sbi_stocks, sbi_funds = parse_sbi_holdings(sbi_file.getvalue())
+            except Exception as e:  # 想定外の形式
+                sbi_stocks, sbi_funds = None, None
+                st.error(f"読み込めませんでした: {e}")
+            if sbi_stocks is not None and sbi_stocks.empty:
+                st.warning("個別株の保有が見つかりませんでした。SBI証券の「保有証券一覧」の CSV かご確認ください。")
+            elif sbi_stocks is not None:
+                pv = sbi_stocks.assign(評価損益=(sbi_stocks["current_price"] - sbi_stocks["avg_price"]) * sbi_stocks["shares"])
+                st.markdown(f"**個別株 {len(pv)} 件**（{', '.join(sorted(pv['account'].unique()))}）")
+                st.dataframe(pv.rename(columns={"ticker": "銘柄", "name": "名称", "shares": "株数", "avg_price": "取得単価",
+                                                "account": "口座", "current_price": "現在値"})
+                             .style.format({"株数": "{:,.0f}", "取得単価": "{:,.1f}", "現在値": "{:,.1f}", "評価損益": "{:+,.0f}"}),
+                             hide_index=True, width="stretch")
+                if sbi_funds is not None and not sbi_funds.empty:
+                    st.caption(f"投資信託 {len(sbi_funds)} 本（評価額 合計 ¥{sbi_funds['market_value'].sum():,.0f}）も参考情報として保存します。")
+                if st.button("この内容で保有銘柄を更新", type="primary"):
+                    res = store.sync_holdings(sbi_stocks)
+                    if sbi_funds is not None:
+                        store.replace_funds(sbi_funds)
+                    st.success(f"取り込みました（新規 {res['added']} 件・更新 {res['updated']} 件・売却済みとして削除 {res['removed']} 件）")
+                    st.rerun()
+
+    st.subheader("保有銘柄の登録（手入力）")
     with st.form("add_holding", clear_on_submit=True):
         c = st.columns([1.2, 1.5, 1, 1, 1, 1.4])
         code = c[0].text_input("銘柄コード", placeholder="7203 / AAPL")

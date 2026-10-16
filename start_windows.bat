@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 > nul
 cd /d "%~dp0"
-where python > nul 2>&1
+python -c "import sys" > nul 2>&1
 if errorlevel 1 (
   echo Python が見つかりません。https://www.python.org/downloads/ からインストールしてください。
   echo インストール時に「Add python.exe to PATH」に必ずチェックを入れてください。

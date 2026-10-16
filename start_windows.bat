@@ -22,6 +22,11 @@ if errorlevel 1 (
   pause
   exit /b
 )
+rem Streamlit 初回起動時のメールアドレス入力を省略する
+if not exist "%USERPROFILE%\.streamlit\credentials.toml" (
+  mkdir "%USERPROFILE%\.streamlit" > nul 2>&1
+  (echo [general]& echo email = "") > "%USERPROFILE%\.streamlit\credentials.toml"
+)
 echo ブラウザが自動で開きます。終了するにはこの黒い画面を閉じてください。
 "%VENV%\Scripts\python.exe" -m streamlit run app.py --server.headless false --browser.gatherUsageStats false
 pause

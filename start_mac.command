@@ -11,5 +11,9 @@ if [ ! -d .venv ]; then
 fi
 source .venv/bin/activate
 pip install -q -r requirements.txt
+if [ ! -f "$HOME/.streamlit/credentials.toml" ]; then
+  mkdir -p "$HOME/.streamlit"
+  printf '[general]\nemail = ""\n' > "$HOME/.streamlit/credentials.toml"
+fi
 echo "ブラウザが自動で開きます。終了するにはこのウィンドウを閉じてください。"
 streamlit run app.py
